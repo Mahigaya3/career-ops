@@ -1,6 +1,7 @@
 // @ts-check
 /** @typedef {import('./_types.js').Provider} Provider */
 import { decodeEntities } from './_html-entities.mjs';
+import { robotsAllows } from '../robots-check.mjs';
 
 // SAP SuccessFactors provider — Recruiting Marketing (RMK, ex-jobs2web) career
 // sites (Career Site Builder's branded job boards). These are the portals big
@@ -53,12 +54,21 @@ import { decodeEntities } from './_html-entities.mjs';
 // otherwise the RMK tile path runs first and, only if it yields zero postings
 // (the empty-shell signature), we fall back to CSB automatically.
 
-const MAX_PAGES = 40; // safety cap on request count (RMK tile pagination)
-const MAX_JOBS = 1000; // cap total postings pulled per site (both strategies)
+const MAX_PAGES = 40; // default cap on request count (RMK tile pagination)
+const MAX_JOBS = 1000; // default cap on total postings pulled per site (both strategies)
+// Opt-in ceilings. An entry may raise the defaults with `max_pages` / `max_jobs`
+// up to these bounds; without either key the defaults above apply unchanged.
+// Raising is also gated on the host's robots.txt (see allowRaise).
+const RMK_MAX_PAGES_CEILING = 400;
+const MAX_JOBS_CEILING = 10000;
+// RMK pages are fetched as ?startrow=N, so the robots gate checks a paged URL (a
+// rule on the query string would not show on the bare path).
+const RMK_GATE_STARTROW = 25;
 
 // CSB knobs.
 const CSB_PAGE_SIZE = 10; // fixed by the /services/recruiting/v1/jobs API
-const CSB_MAX_PAGES_PER_LOCALE = 100; // safety cap per locale (100*10 = 1000 postings)
+const CSB_MAX_PAGES_PER_LOCALE = 100; // default cap per locale (100*10 = 1000 postings)
+const CSB_MAX_PAGES_CEILING = 500; // opt-in ceiling per locale via `max_pages`
 const CSB_MAX_LOCALES = 16; // guard against a tenant advertising an absurd locale list
 // The API's own default sort ("recent", which the site itself sends) is not a
 // stable order: each page request reshuffles ties, so offset paging returned
@@ -312,11 +322,50 @@ export function parseCsbJobs(json, cfg, locale) {
   return out;
 }
 
-/** Resolve the per-locale page cap: positive integer `max_pages`, else default. */
-function resolveCsbMaxPages(entry) {
-  const v = entry?.max_pages;
-  if (Number.isInteger(v) && v > 0) return Math.min(v, CSB_MAX_PAGES_PER_LOCALE);
-  return CSB_MAX_PAGES_PER_LOCALE;
+/** Positive integer config value, else null. */
+function posInt(v) {
+  return Number.isInteger(v) && v > 0 ? v : null;
+}
+
+/**
+ * Resolve the caps for one strategy. `raised` is true when the entry asks for
+ * more than the defaults — the only case that adds request volume, and so the
+ * only case gated on robots.txt. A `max_pages` below the CSB default still
+ * lowers the per-locale cap as before; on RMK it is only honored upward.
+ * @param {any} entry @param {'rmk'|'csb'} kind
+ */
+export function resolveLimits(entry, kind) {
+  const mp = posInt(entry?.max_pages);
+  const mj = posInt(entry?.max_jobs);
+  const defPages = kind === 'csb' ? CSB_MAX_PAGES_PER_LOCALE : MAX_PAGES;
+  const ceiling = kind === 'csb' ? CSB_MAX_PAGES_CEILING : RMK_MAX_PAGES_CEILING;
+  let maxPages = defPages;
+  if (mp !== null) maxPages = kind === 'csb' ? Math.min(mp, ceiling) : Math.max(defPages, Math.min(mp, ceiling));
+  const maxJobs = mj !== null ? Math.min(mj, MAX_JOBS_CEILING) : MAX_JOBS;
+  return { maxPages, maxJobs, raised: maxPages > defPages || maxJobs > MAX_JOBS };
+}
+
+// Raising a cap is extra crawling, so it needs the host's robots.txt to permit
+// the endpoint being paged. A Disallow (or an unreadable robots.txt: the gate
+// fails closed) keeps the defaults and says so.
+/** @param {any} entry @param {'rmk'|'csb'} kind @param {string} url @param {any} ctx */
+async function limitsFor(entry, kind, url, ctx) {
+  const limits = resolveLimits(entry, kind);
+  if (!limits.raised) return limits;
+  const gate = ctx?.robotsGate || robotsAllows;
+  let verdict;
+  try {
+    verdict = await gate(url);
+  } catch (err) {
+    verdict = { allowed: false, reason: `check failed (${err?.message || err})` };
+  }
+  if (verdict?.allowed) return limits;
+  console.error(`⚠️  successfactors: ${entry.name} asks for a higher max_pages/max_jobs but robots.txt does not allow ${new URL(url).pathname} (${verdict?.reason || 'disallowed'}) — keeping the defaults`);
+  // Drop only what exceeds the defaults; a lower CSB max_pages still applies.
+  const defPages = kind === 'csb' ? CSB_MAX_PAGES_PER_LOCALE : MAX_PAGES;
+  const keepPages = posInt(entry?.max_pages) !== null && entry.max_pages <= defPages;
+  const keepJobs = posInt(entry?.max_jobs) !== null && entry.max_jobs <= MAX_JOBS;
+  return resolveLimits({ ...entry, max_pages: keepPages ? entry.max_pages : undefined, max_jobs: keepJobs ? entry.max_jobs : undefined }, kind);
 }
 
 // CSB strategy: discover locales, paginate the JSON jobs API per locale, dedup
@@ -327,7 +376,17 @@ function resolveCsbMaxPages(entry) {
 // board is reachable, just empty of tiles), so an all-locales CSB failure must
 // NOT read as a dead board — return [] instead of throwing.
 /** @param {import('./_types.js').PortalEntry} entry @param {any} cfg @param {import('./_types.js').Context} ctx @param {{probe?: boolean}} [opts] */
-async function fetchCsb(entry, cfg, ctx, { probe = false } = {}) {
+async function fetchCsb(entry, cfg, ctx, { probe = false, quiet = false } = {}) {
+  // The post-RMK probe only looks for the empty-shell signature: defaults, no
+  // robots check, so an RMK entry's raised max_pages is never read as a CSB raise.
+  const limits = probe
+    ? resolveLimits({ ...entry, max_pages: undefined, max_jobs: undefined }, 'csb')
+    : await limitsFor(entry, 'csb', cfg.jobsApi, ctx);
+  const { maxPages } = limits;
+  // A quiet probe (the entry will be re-read in full at its own limits) only needs
+  // to learn whether the board has any posting, so it stops at the first one and
+  // the full read does not repeat its requests.
+  const maxJobs = quiet ? 1 : limits.maxJobs;
   let locales = CSB_DEFAULT_LOCALES;
   try {
     const html = await ctx.fetchText(cfg.searchPage, { redirect: 'error', headers: { accept: 'text/html' } });
@@ -337,8 +396,8 @@ async function fetchCsb(entry, cfg, ctx, { probe = false } = {}) {
     // Discovery is best-effort; fall back to the default locale set.
   }
 
-  const maxPages = resolveCsbMaxPages(entry);
   const jobs = [];
+  const truncated = [];
   const seen = new Set();
   // When EVERY locale fails without a single successful request the board is
   // unreachable, not empty — THROW so scan/portal-health record a failure
@@ -349,7 +408,10 @@ async function fetchCsb(entry, cfg, ctx, { probe = false } = {}) {
   let firstErr = null;
 
   for (const locale of locales) {
-    if (jobs.length >= MAX_JOBS) break;
+    if (jobs.length >= maxJobs) {
+      truncated.push(`locales not read: ${locales.slice(locales.indexOf(locale)).join(', ')}`);
+      break;
+    }
     const fetchPage = (page) => ctx.fetchJson(cfg.jobsApi, {
       method: 'POST',
       redirect: 'error',
@@ -358,6 +420,9 @@ async function fetchCsb(entry, cfg, ctx, { probe = false } = {}) {
     });
     let total = null;
     let failed = false;
+    // True only when a cap (page or job) ended the read of this locale. A short
+    // page, an empty page, the reported total, or a fetch error are not caps.
+    let capHit = false;
     const localeIds = new Set();
     for (let sweep = 0; sweep < CSB_SWEEPS; sweep++) {
       const lastPageFor = (count) => Math.min(maxPages - 1, Math.ceil(count / CSB_PAGE_SIZE) - 1);
@@ -398,40 +463,89 @@ async function fetchCsb(entry, cfg, ctx, { probe = false } = {}) {
             const job = { title: row.title, url: row.url, company: entry.name, location: row.location };
             if (typeof row.postedAt === 'number') job.postedAt = row.postedAt;
             jobs.push(job);
-            if (jobs.length >= MAX_JOBS) break pages;
+            if (jobs.length >= maxJobs) {
+              capHit = total === null || localeIds.size < total;
+              break pages;
+            }
           }
+          if (batch[i] === maxPages - 1 && rawCount >= CSB_PAGE_SIZE && (total === null || (batch[i] + 1) * CSB_PAGE_SIZE < total)) capHit = true;
           // Stop once we've covered the reported total, or on a short page.
           if (total !== null && (batch[i] + 1) * CSB_PAGE_SIZE >= total) break pages;
           if (rawCount < CSB_PAGE_SIZE) break pages;
         }
         page = batch[batch.length - 1] + 1;
       }
-      if (failed || total === null || localeIds.size >= total || jobs.length >= MAX_JOBS) break;
+      if (failed || total === null || localeIds.size >= total || jobs.length >= maxJobs) break;
     }
+    // A cap, not a failure or the natural end, stopped this locale: say so instead
+    // of returning a silent subset.
+    if (capHit) truncated.push(total !== null ? `${locale} ${localeIds.size} of ${total} jobs` : `${locale} ${localeIds.size} jobs, total unknown`);
   }
+  if (truncated.length && !quiet) warnTruncated(entry, truncated.join('; '), 'csb', maxPages, maxJobs);
   if (!probe && !succeededOnce && firstErr) throw firstErr;
   return jobs;
+}
+
+// Names the entry and the knobs that raise the cap that stopped the read, in
+// the wording eightfold.mjs uses for the same situation.
+/** @param {any} entry @param {string} what @param {'rmk'|'csb'} kind @param {number} maxPages @param {number} maxJobs */
+function warnTruncated(entry, what, kind, maxPages, maxJobs) {
+  const pages = kind === 'csb' ? `max_pages=${maxPages} per locale` : `max_pages=${maxPages}`;
+  console.error(`⚠️  successfactors: ${entry.name} truncated at ${pages}, max_jobs=${maxJobs} (${what}) — raise max_pages and/or max_jobs on this entry for more`);
 }
 
 // RMK strategy: the original /tile-search-results/ HTML-fragment scraper.
 /** @param {import('./_types.js').PortalEntry} entry @param {any} cfg @param {import('./_types.js').Context} ctx */
 async function fetchRmk(entry, cfg, ctx) {
+  // A bounded probe (ctx.maxPages, e.g. verify-portals) never raises the cap, so
+  // it skips the robots check and stops at ctx.maxPages without warning.
+  const probeLimit = posInt(ctx.maxPages);
+  const { maxPages: cappedPages, maxJobs } = probeLimit
+    ? resolveLimits({ ...entry, max_pages: undefined, max_jobs: undefined }, 'rmk')
+    : await limitsFor(entry, 'rmk', `${cfg.tileApi}?startrow=${RMK_GATE_STARTROW}`, ctx);
+  const maxPages = probeLimit ? Math.min(cappedPages, probeLimit) : cappedPages;
   const jobs = [];
   const seen = new Set();
+  const seenRaw = new Set();
   let startrow = 0;
-  for (let page = 0; page < MAX_PAGES; page++) {
+  // True when the loop ended on a cap while the last page was still delivering
+  // new postings — i.e. the board very likely has more. The RMK fragment carries
+  // no total, so the warning can only say "at least".
+  let capped = false;
+  let pageSize = 0;
+  const gate = ctx?.robotsGate || robotsAllows;
+  for (let page = 0; page < maxPages; page++) {
+    // Pages past the default cap are extra crawling: check each actual startrow
+    // URL (a rule can allow one offset and disallow a later one). On a denial,
+    // stop here at what the defaults would have read and say so.
+    if ((page >= MAX_PAGES || jobs.length >= MAX_JOBS) && !probeLimit) {
+      let ok = false;
+      try { ok = !!(await gate(`${cfg.tileApi}?startrow=${startrow}`))?.allowed; } catch { ok = false; }
+      if (!ok) {
+        console.error(`⚠️  successfactors: ${entry.name} stopped raising max_pages at page ${page + 1} because robots.txt does not allow ${new URL(cfg.tileApi).pathname}?startrow=${startrow} — keeping what the defaults read`);
+        capped = false;
+        break;
+      }
+    }
     const htmlText = await ctx.fetchText(`${cfg.tileApi}?startrow=${startrow}`, {
       redirect: 'error',
       headers: { accept: 'text/html' },
     });
     const tiles = parseTiles(htmlText, cfg.jobBase);
-    if (tiles.length === 0) break;
+    // Pagination follows the rows the source returned, not the ones parseTiles kept:
+    // a title-less tile must not end the walk or leave the next offset overlapping.
+    const rawIds = [...htmlText.matchAll(/<li class="job-tile job-id-(\d+)/g)].map((m) => m[1]);
+    if (rawIds.length === 0) break;
+    // Fullness is judged on the rows the source returned, not on the tiles that
+    // survived parseTiles' filtering.
+    const rawTiles = rawIds.length;
+    if (page === 0) pageSize = rawTiles;
 
-    let fresh = 0;
+    let fresh = rawIds.filter((id) => !seenRaw.has(id)).length;
+    for (const id of rawIds) seenRaw.add(id);
     for (const tile of tiles) {
       if (seen.has(tile.id)) continue;
       seen.add(tile.id);
-      fresh++;
       jobs.push({
         title: tile.title,
         url: tile.url,
@@ -441,11 +555,16 @@ async function fetchRmk(entry, cfg, ctx) {
     }
     // No new ids this page → server ignored the offset (or we've looped). Stop.
     if (fresh === 0) break;
-    if (jobs.length >= MAX_JOBS) break;
-    startrow += tiles.length;
+    startrow += rawTiles;
+    if (jobs.length >= maxJobs || page === maxPages - 1) {
+      // A short final page means the board ended on its own, not at the cap.
+      capped = !probeLimit && (jobs.length >= maxJobs || rawTiles >= pageSize);
+      break;
+    }
   }
+  if (capped) warnTruncated(entry, `stopped at ${Math.min(jobs.length, maxJobs)} jobs, more were still being returned`, 'rmk', maxPages, maxJobs);
   // The cap is checked between pages, so the last page can overshoot it.
-  return jobs.slice(0, MAX_JOBS);
+  return jobs.slice(0, maxJobs);
 }
 
 /** @type {Provider} */
@@ -474,6 +593,11 @@ export default {
     // RMK answered (healthy, possibly legitimately empty) — the CSB call here
     // is only a probe for the empty-shell signature, so it must not turn a
     // failing/absent CSB endpoint into a dead-board throw.
-    return fetchCsb(entry, cfg, ctx, { probe: true });
+    // An opted-in entry (raised max_pages/max_jobs) that turns out to be CSB gets
+    // a second, robots-gated read at its own limits; the bounded probe stays quiet.
+    const raised = resolveLimits(entry, 'csb').raised;
+    const probed = await fetchCsb(entry, cfg, ctx, { probe: true, quiet: raised });
+    if (raised && probed.length > 0) return fetchCsb(entry, cfg, ctx);
+    return probed;
   },
 };
