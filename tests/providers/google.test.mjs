@@ -255,6 +255,30 @@ try {
       : fail(`google later-query failure: threw=${threw?.message} jobs=${jobs?.length} ${JSON.stringify(logged)}`);
   }
   {
+    // An earlier query whose first request fails keeps a later query's jobs,
+    // warns, and does not throw.
+    const err404 = Object.assign(new Error('Not Found'), { status: 404 });
+    const query = (url) => { if (qOf(url) === 'alpha') throw err404; return linkPage(['5000', '5001']); };
+    const { ctx } = recordingCtx((c) => query(c.url));
+    let jobs; let threw = null;
+    const logged = await captureErrors(async () => {
+      try { jobs = await provider.fetch({ name: 'Google', google: { queries: ['alpha', 'beta'] } }, ctx); } catch (e) { threw = e; }
+    });
+    !threw && jobs?.length === 2 && logged.some((l) => /stopped "alpha" at page 1/.test(l))
+      ? pass('google.fetch() keeps a later query\'s jobs when an earlier query\'s first request fails, and warns')
+      : fail(`google earlier-query failure: threw=${threw?.message} jobs=${jobs?.length} ${JSON.stringify(logged)}`);
+  }
+  {
+    // When EVERY query fails on page 1, throws the first error (total outage).
+    const boom = Object.assign(new Error('Service Unavailable'), { status: 503 });
+    const { ctx } = recordingCtx(() => { throw boom; });
+    let threw = null;
+    try { await provider.fetch({ name: 'Google', google: { queries: ['alpha', 'beta'] } }, ctx); } catch (e) { threw = e; }
+    threw === boom
+      ? pass('google.fetch() throws when every query fails on page 1 (total outage)')
+      : fail(`google total outage: threw=${threw?.message}`);
+  }
+  {
     // While probing, a rejection propagates unwrapped (verify-portals needs it).
     const boom = Object.assign(new Error('budget'), { status: 503 });
     const { ctx } = recordingCtx(() => { throw boom; });
