@@ -25,6 +25,8 @@ import { LINKEDIN_DOCTOR_LABEL, linkedInPluginFix } from './lib/linkedin-import.
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const argv = process.argv.slice(2);
+const explicitTarget = flagValue(argv, '--target') || null;
+const codeRoot = explicitTarget || __dirname;
 
 // path-resolver.mjs refuses an explicit data root inside a plugin install copy,
 // and some modules loaded below resolve the root as they load. Ask once, first,
@@ -38,6 +40,8 @@ try {
     // onboardingNeeded stays true so nothing proceeds on this root.
     console.log(JSON.stringify({
       onboardingNeeded: true,
+      data_root: err.root || null,
+      project_root: codeRoot,
       missing: [],
       unpersonalized: [],
       warnings: [err.message],
@@ -120,7 +124,6 @@ CLIs: ${AGENT_CLIS.join(', ')}`;
 // shared message.
 validateFlags(argv, KNOWN_FLAGS, USAGE, { valueFlags: VALUE_FLAGS, requireOperand: true });
 
-const explicitTarget = flagValue(argv, '--target') || null;
 const projectRoot = explicitTarget || getCareerOpsRoot();
 // --target diagnoses a whole other checkout, so that checkout's profile is the
 // one that counts; otherwise CAREER_OPS_PROFILE applies as it does everywhere.
@@ -147,7 +150,6 @@ const profileFromEnvFile = (root) => {
 // the one case that means "diagnose this whole other checkout" — code layer
 // included — so it keeps pointing both roots at the same place, matching how
 // tests/doctor-tracked-bak-files.test.mjs already exercises it.
-const codeRoot = explicitTarget || __dirname;
 const JSON_OUT = argv.includes('--json');
 const INIT_TEMPLATES = argv.includes('--init-templates');
 if (INIT_TEMPLATES && !JSON_OUT) {
@@ -1975,6 +1977,8 @@ function onboardingState(root) {
   } catch { plugins = []; }
   return {
     onboardingNeeded: missing.length > 0,
+    data_root: root,
+    project_root: codeRoot,
     missing,
     // Non-blocking by design: career-ops is meant to work out of the box, so an
     // unedited personalization file must not gate the whole system. It DOES have
