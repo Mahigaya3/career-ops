@@ -140,6 +140,8 @@ export default {
     const byId = new Map();
     let requestsMade = 0;
     let truncated = false;
+    let firstPageFailures = 0;
+    let firstPageError;
 
     for (const q of queriesToRun) {
       // IDs seen in THIS query's walk: a page that adds none is Google
@@ -158,11 +160,15 @@ export default {
         try {
           html = await fetchTextWithRetry(ctx, url, { redirect: 'error' });
         } catch (err) {
-          // The first request failing means the board is broken, not empty, and
-          // a probe needs the rejection unwrapped so its request-budget sentinel
-          // keeps its identity. Otherwise keep the queries already collected
-          // rather than lose them to one bad search, and move to the next query.
-          if (probing || requestsMade === 0) throw err;
+          // While probing, a rejection propagates unwrapped (verify-portals needs it).
+          // Track page-1 failures across all queries: if every query fails on page 1,
+          // throw the first error (a total outage). Otherwise, keep the jobs collected
+          // from successful queries, warn, and move to the next query.
+          if (probing) throw err;
+          if (page === 1) {
+            if (firstPageFailures === 0) firstPageError = err;
+            firstPageFailures += 1;
+          }
           const cause = err instanceof Error ? err.message : String(err);
           console.error(`⚠️  google: ${entry.name} stopped "${q}" at page ${page} (${byId.size} jobs so far): ${cause}`);
           break;
@@ -186,6 +192,9 @@ export default {
         if (cards.length === 0 || newThisQuery === 0 || cards.length < PAGE_SIZE) break;
         if (page === maxPages && !probing) truncated = true;
       }
+    }
+    if (firstPageFailures === queriesToRun.length && firstPageError) {
+      throw firstPageError;
     }
     if (truncated) {
       console.error(`⚠️  google: ${entry.name} hit the ${maxPages}-page cap on at least one query — raise max_pages on this entry for more`);
